@@ -15,8 +15,10 @@ from dotenv import load_dotenv
 import phonenumbers
 from phonenumbers import geocoder, carrier
 
+from bs4 import BeautifulSoup
+
 # =======================
-# 🔐 CONFIG
+# CONFIG
 # =======================
 load_dotenv()
 
@@ -24,7 +26,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 REDIS_URL = os.getenv("REDIS_URL")
 
 # =======================
-# ⚡ REDIS
+# REDIS
 # =======================
 redis_client = None
 if REDIS_URL:
@@ -40,21 +42,14 @@ async def set_cache(key, value, ttl=300):
         await redis_client.set(key, value, ex=ttl)
 
 # =======================
-# 🌐 API CLIENT
+# HTTP CLIENT
 # =======================
-class APIClient:
-    def __init__(self):
-        self.client = httpx.AsyncClient(timeout=10)
-
-    async def get(self, url, params=None):
-        r = await self.client.get(url, params=params)
-        r.raise_for_status()
-        return r.json()
-
-api_client = APIClient()
+client = httpx.AsyncClient(timeout=10, headers={
+    "User-Agent": "Mozilla/5.0"
+})
 
 # =======================
-# 🛑 АНТИФЛУД
+# АНТИФЛУД
 # =======================
 class ThrottlingMiddleware(BaseMiddleware):
     def __init__(self, rate_limit=1):
@@ -64,9 +59,8 @@ class ThrottlingMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: Message, data):
         uid = event.from_user.id
         now = time.time()
-        last = self.users.get(uid, 0)
 
-        if now - last < self.rate_limit:
+        if now - self.users.get(uid, 0) < self.rate_limit:
             await event.answer("Не спамь 😅")
             return
 
@@ -74,109 +68,101 @@ class ThrottlingMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 # =======================
-# 🔍 ДЕТЕКТОРЫ
+# ДЕТЕКТОРЫ
 # =======================
-def is_phone(text: str):
+def is_phone(text):
     return re.match(r"^\+?\d{10,15}$", text)
 
-def is_email(text: str):
+def is_email(text):
     return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", text)
 
-def is_username(text: str):
+def is_username(text):
     return text.startswith("@")
 
 # =======================
-# 📱 PHONE INFO
+# PHONE
 # =======================
-def get_phone_info(number_raw: str):
+def get_phone_info(number_raw):
     try:
         number = phonenumbers.parse(number_raw)
         if not phonenumbers.is_valid_number(number):
             return "❌ Номер невалидный"
 
-        country = geocoder.description_for_number(number, "ru")
-        operator = carrier.name_for_number(number, "ru")
-
         return (
-            f"📱 Номер: {number_raw}\n"
-            f"🌍 Регион: {country}\n"
-            f"📡 Оператор: {operator or 'неизвестно'}"
+            f"📱 {number_raw}\n"
+            f"🌍 {geocoder.description_for_number(number, 'ru')}\n"
+            f"📡 {carrier.name_for_number(number, 'ru') or 'неизвестно'}"
         )
     except:
-        return "❌ Ошибка обработки номера"
+        return "❌ Ошибка номера"
 
 # =======================
-# 👤 TELEGRAM USER
+# TELEGRAM
 # =======================
-async def get_user_info(bot: Bot, username: str):
+async def get_user_info(bot, username):
     try:
         chat = await bot.get_chat(username)
-
-        return (
-            f"👤 Username: {chat.username}\n"
-            f"🆔 ID: {chat.id}\n"
-            f"📛 Имя: {chat.first_name or ''} {chat.last_name or ''}\n"
-            f"📝 Bio: {chat.bio or 'нет'}\n"
-        )
+        return f"👤 {chat.username}\n🆔 {chat.id}\n📛 {chat.first_name or ''}"
     except:
-        return "👤 Telegram: данных нет (не писал боту)\n"
+        return "👤 Нет данных Telegram"
 
 # =======================
-# 🌐 СОЦСЕТИ ПО ЮЗУ
+# 🌐 ПАРСИНГ ПОИСКА
 # =======================
-async def find_socials(username: str):
+async def parse_search(query):
+    try:
+        url = f"https://html.duckduckgo.com/html/?q={query}"
+        r = await client.get(url)
+
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        results = []
+        for a in soup.select(".result__a")[:5]:
+            title = a.get_text(strip=True)
+            link = a.get("href")
+            results.append(f"🔗 {title}\n{link}")
+
+        if not results:
+            return "🔎 Ничего не найдено"
+
+        return "🔎 Найдено:\n\n" + "\n\n".join(results)
+
+    except:
+        return "❌ Ошибка парсинга"
+
+# =======================
+# СОЦСЕТИ
+# =======================
+async def find_socials(username):
     uname = username.replace("@", "")
 
     links = [
         f"https://instagram.com/{uname}",
         f"https://tiktok.com/@{uname}",
-        f"https://twitter.com/{uname}",
         f"https://github.com/{uname}",
         f"https://vk.com/{uname}",
-        f"https://facebook.com/{uname}",
     ]
 
-    result = "🌐 Возможные соцсети:\n"
-    for link in links:
-        result += f"{link}\n"
+    result = "🌐 Соцсети:\n" + "\n".join(links)
 
-    # доп поиск
-    search = await api_client.get(
-        "https://api.duckduckgo.com/",
-        params={"q": uname, "format": "json"}
-    )
+    deep = await parse_search(uname)
 
-    if search.get("Abstract"):
-        result += f"\n🔎 Инфо:\n{search['Abstract']}"
-
-    return result
+    return result + "\n\n" + deep
 
 # =======================
-# 📧 EMAIL CHECK
+# EMAIL
 # =======================
-async def get_email_info(email: str):
-    domain = email.split("@")[-1]
-
-    return (
-        f"📧 Email: {email}\n"
-        f"🌐 Домен: {domain}\n"
-    )
+async def get_email_info(email):
+    return f"📧 {email}\n🌐 {email.split('@')[-1]}"
 
 # =======================
-# 🤖 HANDLER
+# HANDLER
 # =======================
 router = Router()
 
 @router.message(CommandStart())
 async def start_handler(message: Message):
-    await message.answer(
-        "🚀 Бот запущен\n\n"
-        "Просто отправь:\n"
-        "📱 номер\n"
-        "👤 @username\n"
-        "📧 email\n\n"
-        "Я найду открытую информацию 🔎"
-    )
+    await message.answer("🚀 Просто отправь номер / @username / email")
 
 @router.message()
 async def universal_handler(message: Message):
@@ -184,28 +170,28 @@ async def universal_handler(message: Message):
 
     cached = await get_cache(text)
     if cached:
-        await message.answer(f"(из кэша)\n{cached}")
+        await message.answer(f"(кэш)\n{cached}")
         return
 
     if is_phone(text):
         result = get_phone_info(text)
 
     elif is_username(text):
-        tg_info = await get_user_info(message.bot, text)
-        socials = await find_socials(text)
-        result = tg_info + "\n" + socials
+        tg = await get_user_info(message.bot, text)
+        social = await find_socials(text)
+        result = tg + "\n\n" + social
 
     elif is_email(text):
         result = await get_email_info(text)
 
     else:
-        result = "❌ Не удалось определить тип данных"
+        result = await parse_search(text)
 
     await set_cache(text, result)
     await message.answer(result)
 
 # =======================
-# 🚀 MAIN
+# MAIN
 # =======================
 async def main():
     bot = Bot(token=BOT_TOKEN)
