@@ -1,15 +1,19 @@
 import asyncio
 import time
 import os
+import re
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.types import Message
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart
 from aiogram import BaseMiddleware
 
 import httpx
 import redis.asyncio as redis
 from dotenv import load_dotenv
+
+import phonenumbers
+from phonenumbers import geocoder, carrier
 
 # =======================
 # 🔐 CONFIG
@@ -20,18 +24,20 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 REDIS_URL = os.getenv("REDIS_URL")
 
 # =======================
-# ⚡ REDIS (кэш)
+# ⚡ REDIS
 # =======================
-redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+redis_client = None
+if REDIS_URL:
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
-
-async def get_cache(key: str):
+async def get_cache(key):
+    if not redis_client:
+        return None
     return await redis_client.get(key)
 
-
-async def set_cache(key: str, value: str, ttl: int = 300):
-    await redis_client.set(key, value, ex=ttl)
-
+async def set_cache(key, value, ttl=300):
+    if redis_client:
+        await redis_client.set(key, value, ex=ttl)
 
 # =======================
 # 🌐 API CLIENT
@@ -40,28 +46,12 @@ class APIClient:
     def __init__(self):
         self.client = httpx.AsyncClient(timeout=10)
 
-    async def get(self, url: str, params=None):
-        response = await self.client.get(url, params=params)
-        response.raise_for_status()
-        return response.json()
-
+    async def get(self, url, params=None):
+        r = await self.client.get(url, params=params)
+        r.raise_for_status()
+        return r.json()
 
 api_client = APIClient()
-
-# =======================
-# 🧠 SEARCH SERVICE
-# =======================
-async def search_info(query: str) -> str:
-    data = await api_client.get(
-        "https://api.duckduckgo.com/",
-        params={"q": query, "format": "json"}
-    )
-
-    if data.get("Abstract"):
-        return f"🔎 {query}\n\n{data['Abstract']}"
-
-    return "Ничего не найдено 🤷‍♂️"
-
 
 # =======================
 # 🛑 АНТИФЛУД
@@ -72,56 +62,131 @@ class ThrottlingMiddleware(BaseMiddleware):
         self.users = {}
 
     async def __call__(self, handler, event: Message, data):
-        user_id = event.from_user.id
+        uid = event.from_user.id
         now = time.time()
+        last = self.users.get(uid, 0)
 
-        last_time = self.users.get(user_id, 0)
-
-        if now - last_time < self.rate_limit:
+        if now - last < self.rate_limit:
             await event.answer("Не спамь 😅")
             return
 
-        self.users[user_id] = now
+        self.users[uid] = now
         return await handler(event, data)
 
+# =======================
+# 🔍 ДЕТЕКТОРЫ
+# =======================
+def is_phone(text: str):
+    return re.match(r"^\+?\d{10,15}$", text)
+
+def is_email(text: str):
+    return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", text)
+
+def is_username(text: str):
+    return text.startswith("@")
 
 # =======================
-# 🤖 HANDLERS
+# 📱 PHONE INFO
+# =======================
+def get_phone_info(number_raw: str):
+    try:
+        number = phonenumbers.parse(number_raw)
+        if not phonenumbers.is_valid_number(number):
+            return "❌ Номер невалидный"
+
+        country = geocoder.description_for_number(number, "ru")
+        operator = carrier.name_for_number(number, "ru")
+
+        return (
+            f"📱 Номер: {number_raw}\n"
+            f"🌍 Регион: {country}\n"
+            f"📡 Оператор: {operator or 'неизвестно'}"
+        )
+    except:
+        return "❌ Ошибка обработки номера"
+
+# =======================
+# 👤 TELEGRAM USER
+# =======================
+async def get_user_info(bot: Bot, username: str):
+    try:
+        chat = await bot.get_chat(username)
+
+        return (
+            f"👤 Username: {chat.username}\n"
+            f"🆔 ID: {chat.id}\n"
+            f"📛 Имя: {chat.first_name or ''} {chat.last_name or ''}\n"
+            f"📝 Bio: {chat.bio or 'нет'}"
+        )
+    except:
+        return "❌ Не удалось получить данные (пользователь должен написать боту)"
+
+# =======================
+# 📧 EMAIL CHECK (базово)
+# =======================
+async def get_email_info(email: str):
+    domain = email.split("@")[-1]
+
+    return (
+        f"📧 Email: {email}\n"
+        f"🌐 Домен: {domain}\n"
+        f"ℹ️ Проверка утечек: добавь API позже"
+    )
+
+# =======================
+# 🌐 SEARCH (fallback)
+# =======================
+async def search_info(query: str):
+    data = await api_client.get(
+        "https://api.duckduckgo.com/",
+        params={"q": query, "format": "json"}
+    )
+
+    return data.get("Abstract") or "Ничего не найдено 🤷‍♂️"
+
+# =======================
+# 🤖 HANDLER
 # =======================
 router = Router()
-
 
 @router.message(CommandStart())
 async def start_handler(message: Message):
     await message.answer(
         "🚀 Бот запущен\n\n"
-        "Команды:\n"
-        "/search запрос — поиск информации"
+        "Просто отправь:\n"
+        "📱 номер\n"
+        "👤 @username\n"
+        "📧 email\n\n"
+        "Я сам определю и найду инфу 🔎"
     )
 
+@router.message()
+async def universal_handler(message: Message):
+    text = message.text.strip()
 
-@router.message(Command("search"))
-async def search_handler(message: Message):
-    query = message.text.replace("/search", "").strip()
-
-    if not query:
-        await message.answer("Напиши запрос после команды")
-        return
-
-    # проверка кэша
-    cached = await get_cache(query)
+    cached = await get_cache(text)
     if cached:
         await message.answer(f"(из кэша)\n{cached}")
         return
 
-    # запрос
-    result = await search_info(query)
+    # PHONE
+    if is_phone(text):
+        result = get_phone_info(text)
 
-    # сохранить в кэш
-    await set_cache(query, result)
+    # USERNAME
+    elif is_username(text):
+        result = await get_user_info(message.bot, text)
 
+    # EMAIL
+    elif is_email(text):
+        result = await get_email_info(text)
+
+    # FALLBACK SEARCH
+    else:
+        result = await search_info(text)
+
+    await set_cache(text, result)
     await message.answer(result)
-
 
 # =======================
 # 🚀 MAIN
@@ -130,15 +195,11 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
 
-    # middleware
     dp.message.middleware(ThrottlingMiddleware())
-
-    # роутер
     dp.include_router(router)
 
-    print("✅ Бот запущен...")
+    print("✅ Бот запущен")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
