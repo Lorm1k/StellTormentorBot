@@ -116,13 +116,43 @@ async def get_user_info(bot: Bot, username: str):
             f"👤 Username: {chat.username}\n"
             f"🆔 ID: {chat.id}\n"
             f"📛 Имя: {chat.first_name or ''} {chat.last_name or ''}\n"
-            f"📝 Bio: {chat.bio or 'нет'}"
+            f"📝 Bio: {chat.bio or 'нет'}\n"
         )
     except:
-        return "❌ Не удалось получить данные (пользователь должен написать боту)"
+        return "👤 Telegram: данных нет (не писал боту)\n"
 
 # =======================
-# 📧 EMAIL CHECK (базово)
+# 🌐 СОЦСЕТИ ПО ЮЗУ
+# =======================
+async def find_socials(username: str):
+    uname = username.replace("@", "")
+
+    links = [
+        f"https://instagram.com/{uname}",
+        f"https://tiktok.com/@{uname}",
+        f"https://twitter.com/{uname}",
+        f"https://github.com/{uname}",
+        f"https://vk.com/{uname}",
+        f"https://facebook.com/{uname}",
+    ]
+
+    result = "🌐 Возможные соцсети:\n"
+    for link in links:
+        result += f"{link}\n"
+
+    # доп поиск
+    search = await api_client.get(
+        "https://api.duckduckgo.com/",
+        params={"q": uname, "format": "json"}
+    )
+
+    if search.get("Abstract"):
+        result += f"\n🔎 Инфо:\n{search['Abstract']}"
+
+    return result
+
+# =======================
+# 📧 EMAIL CHECK
 # =======================
 async def get_email_info(email: str):
     domain = email.split("@")[-1]
@@ -130,19 +160,7 @@ async def get_email_info(email: str):
     return (
         f"📧 Email: {email}\n"
         f"🌐 Домен: {domain}\n"
-        f"ℹ️ Проверка утечек: добавь API позже"
     )
-
-# =======================
-# 🌐 SEARCH (fallback)
-# =======================
-async def search_info(query: str):
-    data = await api_client.get(
-        "https://api.duckduckgo.com/",
-        params={"q": query, "format": "json"}
-    )
-
-    return data.get("Abstract") or "Ничего не найдено 🤷‍♂️"
 
 # =======================
 # 🤖 HANDLER
@@ -157,7 +175,7 @@ async def start_handler(message: Message):
         "📱 номер\n"
         "👤 @username\n"
         "📧 email\n\n"
-        "Я сам определю и найду инфу 🔎"
+        "Я найду открытую информацию 🔎"
     )
 
 @router.message()
@@ -169,21 +187,19 @@ async def universal_handler(message: Message):
         await message.answer(f"(из кэша)\n{cached}")
         return
 
-    # PHONE
     if is_phone(text):
         result = get_phone_info(text)
 
-    # USERNAME
     elif is_username(text):
-        result = await get_user_info(message.bot, text)
+        tg_info = await get_user_info(message.bot, text)
+        socials = await find_socials(text)
+        result = tg_info + "\n" + socials
 
-    # EMAIL
     elif is_email(text):
         result = await get_email_info(text)
 
-    # FALLBACK SEARCH
     else:
-        result = await search_info(text)
+        result = "❌ Не удалось определить тип данных"
 
     await set_cache(text, result)
     await message.answer(result)
