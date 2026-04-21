@@ -2,6 +2,7 @@ import asyncio
 import time
 import os
 import re
+import logging
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.types import Message
@@ -18,6 +19,11 @@ from phonenumbers import geocoder, carrier
 from bs4 import BeautifulSoup
 
 # =======================
+# LOGGING
+# =======================
+logging.basicConfig(level=logging.INFO)
+
+# =======================
 # CONFIG
 # =======================
 load_dotenv()
@@ -31,16 +37,26 @@ REDIS_URL = os.getenv("REDIS_URL")
 redis_client = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 
 async def get_cache(key):
-    return await redis_client.get(key) if redis_client else None
+    try:
+        return await redis_client.get(key) if redis_client else None
+    except Exception as e:
+        logging.error(f"Redis get error: {e}")
+        return None
 
 async def set_cache(key, value, ttl=300):
-    if redis_client:
-        await redis_client.set(key, value, ex=ttl)
+    try:
+        if redis_client:
+            await redis_client.set(key, value, ex=ttl)
+    except Exception as e:
+        logging.error(f"Redis set error: {e}")
 
 # =======================
 # HTTP CLIENT
 # =======================
-client = httpx.AsyncClient(timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+client = httpx.AsyncClient(
+    timeout=httpx.Timeout(10.0),
+    headers={"User-Agent": "Mozilla/5.0"}
+)
 
 # =======================
 # АНТИФЛУД
@@ -62,13 +78,16 @@ class ThrottlingMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 # =======================
-# ДЕТЕКТОРЫ
+# DETECTORS (компилируем regex)
 # =======================
+PHONE_RE = re.compile(r"^\+?\d{10,15}$")
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
 def is_phone(text):
-    return re.match(r"^\+?\d{10,15}$", text)
+    return PHONE_RE.match(text)
 
 def is_email(text):
-    return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", text)
+    return EMAIL_RE.match(text)
 
 def is_username(text):
     return text.startswith("@")
@@ -87,7 +106,8 @@ def get_phone_info(number_raw):
             f"🌍 {geocoder.description_for_number(number, 'ru')}\n"
             f"📡 {carrier.name_for_number(number, 'ru') or 'неизвестно'}"
         )
-    except:
+    except Exception as e:
+        logging.error(f"Phone error: {e}")
         return "❌ Ошибка номера"
 
 # =======================
@@ -97,26 +117,27 @@ async def get_user_info(bot, username):
     try:
         chat = await bot.get_chat(username)
         return f"👤 {chat.username}\n🆔 {chat.id}\n📛 {chat.first_name or ''}"
-    except:
+    except Exception as e:
+        logging.warning(f"TG error: {e}")
         return "👤 Нет данных Telegram"
 
 # =======================
-# 🔍 ПРОВЕРКА СУЩЕСТВОВАНИЯ
+# ПРОВЕРКА САЙТА
 # =======================
 async def check_profile(url):
     try:
         r = await client.get(url)
         if r.status_code == 200:
             soup = BeautifulSoup(r.text, "html.parser")
-            title = soup.title.string if soup.title else "нет"
-
+            title = soup.title.string.strip() if soup.title else "нет"
             return f"✅ {url}\n📌 {title[:60]}"
         return f"❌ {url}"
-    except:
+    except Exception as e:
+        logging.warning(f"Profile check error: {e}")
         return f"❌ {url}"
 
 # =======================
-# 🌐 СОЦСЕТИ + ПРОВЕРКА
+# СОЦСЕТИ (параллельно 🚀)
 # =======================
 async def find_socials(username):
     uname = username.replace("@", "")
@@ -128,15 +149,13 @@ async def find_socials(username):
         f"https://vk.com/{uname}",
     ]
 
-    results = []
-    for url in sites:
-        res = await check_profile(url)
-        results.append(res)
+    tasks = [check_profile(url) for url in sites]
+    results = await asyncio.gather(*tasks)
 
     return "🌐 Проверка соцсетей:\n\n" + "\n\n".join(results)
 
 # =======================
-# 🔎 ПАРСИНГ ПОИСКА
+# ПОИСК
 # =======================
 async def parse_search(query):
     try:
@@ -150,16 +169,17 @@ async def parse_search(query):
             results.append(a.get_text(strip=True))
 
         return "🔎 Найдено:\n" + "\n".join(results)
-    except:
+    except Exception as e:
+        logging.error(f"Search error: {e}")
         return "❌ Ошибка поиска"
 
 # =======================
-# 🧠 ПРОСТОЙ АНАЛИЗ
+# AI (простая логика)
 # =======================
 def analyze_text(text):
     words = text.lower()
 
-    if "dev" in words or "github" in words:
+    if any(x in words for x in ["dev", "github", "code"]):
         return "🧠 Похоже на IT / разработку"
     if "shop" in words:
         return "🧠 Возможно коммерция"
@@ -223,7 +243,10 @@ async def main():
     dp.include_router(router)
 
     print("✅ Бот запущен")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await client.aclose()
 
 if __name__ == "__main__":
     asyncio.run(main())
