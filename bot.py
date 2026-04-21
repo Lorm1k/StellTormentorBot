@@ -28,14 +28,10 @@ REDIS_URL = os.getenv("REDIS_URL")
 # =======================
 # REDIS
 # =======================
-redis_client = None
-if REDIS_URL:
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+redis_client = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 
 async def get_cache(key):
-    if not redis_client:
-        return None
-    return await redis_client.get(key)
+    return await redis_client.get(key) if redis_client else None
 
 async def set_cache(key, value, ttl=300):
     if redis_client:
@@ -44,9 +40,7 @@ async def set_cache(key, value, ttl=300):
 # =======================
 # HTTP CLIENT
 # =======================
-client = httpx.AsyncClient(timeout=10, headers={
-    "User-Agent": "Mozilla/5.0"
-})
+client = httpx.AsyncClient(timeout=10, headers={"User-Agent": "Mozilla/5.0"})
 
 # =======================
 # АНТИФЛУД
@@ -107,7 +101,42 @@ async def get_user_info(bot, username):
         return "👤 Нет данных Telegram"
 
 # =======================
-# 🌐 ПАРСИНГ ПОИСКА
+# 🔍 ПРОВЕРКА СУЩЕСТВОВАНИЯ
+# =======================
+async def check_profile(url):
+    try:
+        r = await client.get(url)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, "html.parser")
+            title = soup.title.string if soup.title else "нет"
+
+            return f"✅ {url}\n📌 {title[:60]}"
+        return f"❌ {url}"
+    except:
+        return f"❌ {url}"
+
+# =======================
+# 🌐 СОЦСЕТИ + ПРОВЕРКА
+# =======================
+async def find_socials(username):
+    uname = username.replace("@", "")
+
+    sites = [
+        f"https://instagram.com/{uname}",
+        f"https://tiktok.com/@{uname}",
+        f"https://github.com/{uname}",
+        f"https://vk.com/{uname}",
+    ]
+
+    results = []
+    for url in sites:
+        res = await check_profile(url)
+        results.append(res)
+
+    return "🌐 Проверка соцсетей:\n\n" + "\n\n".join(results)
+
+# =======================
+# 🔎 ПАРСИНГ ПОИСКА
 # =======================
 async def parse_search(query):
     try:
@@ -118,36 +147,26 @@ async def parse_search(query):
 
         results = []
         for a in soup.select(".result__a")[:5]:
-            title = a.get_text(strip=True)
-            link = a.get("href")
-            results.append(f"🔗 {title}\n{link}")
+            results.append(a.get_text(strip=True))
 
-        if not results:
-            return "🔎 Ничего не найдено"
-
-        return "🔎 Найдено:\n\n" + "\n\n".join(results)
-
+        return "🔎 Найдено:\n" + "\n".join(results)
     except:
-        return "❌ Ошибка парсинга"
+        return "❌ Ошибка поиска"
 
 # =======================
-# СОЦСЕТИ
+# 🧠 ПРОСТОЙ АНАЛИЗ
 # =======================
-async def find_socials(username):
-    uname = username.replace("@", "")
+def analyze_text(text):
+    words = text.lower()
 
-    links = [
-        f"https://instagram.com/{uname}",
-        f"https://tiktok.com/@{uname}",
-        f"https://github.com/{uname}",
-        f"https://vk.com/{uname}",
-    ]
+    if "dev" in words or "github" in words:
+        return "🧠 Похоже на IT / разработку"
+    if "shop" in words:
+        return "🧠 Возможно коммерция"
+    if "blog" in words:
+        return "🧠 Возможно блогер"
 
-    result = "🌐 Соцсети:\n" + "\n".join(links)
-
-    deep = await parse_search(uname)
-
-    return result + "\n\n" + deep
+    return "🧠 Недостаточно данных"
 
 # =======================
 # EMAIL
@@ -162,7 +181,7 @@ router = Router()
 
 @router.message(CommandStart())
 async def start_handler(message: Message):
-    await message.answer("🚀 Просто отправь номер / @username / email")
+    await message.answer("🚀 Отправь номер / @username / email")
 
 @router.message()
 async def universal_handler(message: Message):
@@ -179,7 +198,10 @@ async def universal_handler(message: Message):
     elif is_username(text):
         tg = await get_user_info(message.bot, text)
         social = await find_socials(text)
-        result = tg + "\n\n" + social
+        search = await parse_search(text)
+        ai = analyze_text(search)
+
+        result = f"{tg}\n\n{social}\n\n{search}\n\n{ai}"
 
     elif is_email(text):
         result = await get_email_info(text)
